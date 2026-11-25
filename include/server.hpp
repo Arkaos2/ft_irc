@@ -17,6 +17,8 @@ private:
 	void	accept_client();
 	void	remove_client(size_t i);
 	bool	handle_client(size_t i);
+	Client	*find_client(const std::string &nick);
+	void	leave_channel(const std::string &name, int fd);
 	void	send_channel(const std::string &name, const std::string &msg, int except_fd);
 
 	void	execute(Client &client, const std::string &line);
@@ -25,8 +27,11 @@ private:
 	void	cmd_nick(Client &client, const Command &cmd);
 	void	cmd_user(Client &client, const Command &cmd);
 	void	cmd_join(Client &client, const Command &cmd);
-	void	cmd_part(Client &client, const Command &cmd);
 	void	cmd_privmsg(Client &client, const Command &cmd);
+	void	cmd_topic(Client &client, const Command &cmd);
+	void	cmd_kick(Client &client, const Command &cmd);
+	void	cmd_invite(Client &client, const Command &cmd);
+	void	cmd_ping(Client &client, const Command &cmd);
 public:
 	Server(int listen_fd, std::string password);
 	~Server();

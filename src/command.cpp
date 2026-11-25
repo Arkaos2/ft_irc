@@ -6,8 +6,6 @@ Command::Command(const std::string &line)
 	std::string			word;
 
 	iss >> this->name;
-	for (size_t i = 0; i < this->name.size(); i++)
-		this->name[i] = std::toupper(this->name[i]);
 	while (iss >> word)
 	{
 		// un mot qui commence par ':' prend tout le reste de la ligne

@@ -58,7 +58,20 @@ void	Server::accept_client()
 	this->all_client.insert(std::make_pair(fd, Client(fd, inet_ntoa(addr.sin_addr))));
 }
 
-// ferme le client, le retire de ses channels (et supprime les channels vides)
+// retire fd du channel, et supprime le channel s'il est vide
+// (sinon il garderait son topic et ses modes pour le prochain qui le cree)
+void	Server::leave_channel(const std::string &name, int fd)
+{
+	Channel	&channel = this->all_channel[name];
+
+	channel.members.erase(fd);
+	channel.ops.erase(fd);
+	channel.invited.erase(fd);
+	if (channel.members.empty())
+		this->all_channel.erase(name);
+}
+
+// ferme le client et le retire de ses channels
 void	Server::remove_client(size_t i)
 {
 	int											fd = this->all_fd[i].fd;
@@ -66,12 +79,10 @@ void	Server::remove_client(size_t i)
 
 	while (it != this->all_channel.end())
 	{
-		it->second.members.erase(fd);
-		it->second.ops.erase(fd);
-		if (it->second.members.empty())
-			this->all_channel.erase(it++);
-		else
-			it++;
+		// on avance avant, car leave_channel peut supprimer le channel
+		std::string	name = it->first;
+		it++;
+		this->leave_channel(name, fd);
 	}
 	close(fd);
 	this->all_client.erase(fd);
@@ -87,6 +98,17 @@ void	Server::send_channel(const std::string &name, const std::string &msg, int e
 	for (it = members.begin(); it != members.end(); it++)
 		if (*it != except_fd)
 			this->all_client.find(*it)->second.outbuffer += msg;
+}
+
+// cherche un client enregistre par son pseudo, NULL s'il n'existe pas
+Client	*Server::find_client(const std::string &nick)
+{
+	std::map<int, Client>::iterator	it;
+
+	for (it = this->all_client.begin(); it != this->all_client.end(); it++)
+		if (it->second.registered && it->second.nickname == nick)
+			return (&it->second);
+	return (NULL);
 }
 
 void	Server::cmd_pass(Client &client, const Command &cmd)
@@ -110,12 +132,6 @@ void	Server::cmd_nick(Client &client, const Command &cmd)
 		return ;
 	}
 	std::string	nick = cmd.params[0];
-
-	if (nick.find(':') != std::string::npos || nick[0] == '#')
-	{
-		reply(client, "432", nick, "Erroneous nickname");
-		return ;
-	}
 	std::map<int, Client>::iterator	it;
 	for (it = this->all_client.begin(); it != this->all_client.end(); it++)
 	{
@@ -160,32 +176,6 @@ void	Server::cmd_join(Client &client, const Command &cmd)
 	this->send_channel(name, prefix_of(client) + " JOIN " + name + "\r\n", -1);
 }
 
-void	Server::cmd_part(Client &client, const Command &cmd)
-{
-	if (cmd.params.empty())
-	{
-		reply(client, "461", "PART", "Not enough parameters");
-		return ;
-	}
-	std::string	name = cmd.params[0];
-
-	if (this->all_channel.count(name) == 0)
-	{
-		reply(client, "403", name, "No such channel");
-		return ;
-	}
-	if (this->all_channel[name].members.count(client.fd) == 0)
-	{
-		reply(client, "442", name, "You're not on that channel");
-		return ;
-	}
-	this->send_channel(name, prefix_of(client) + " PART " + name + "\r\n", -1);
-	this->all_channel[name].members.erase(client.fd);
-	this->all_channel[name].ops.erase(client.fd);
-	if (this->all_channel[name].members.empty())
-		this->all_channel.erase(name);
-}
-
 void	Server::cmd_privmsg(Client &client, const Command &cmd)
 {
 	if (cmd.params.empty())
@@ -206,7 +196,7 @@ void	Server::cmd_privmsg(Client &client, const Command &cmd)
 		if (this->all_channel.count(target) == 0)
 			reply(client, "403", target, "No such channel");
 		else if (this->all_channel[target].members.count(client.fd) == 0)
-			reply(client, "404", target, "Cannot send to channel");
+			reply(client, "404", target, "Cannot send to channel");	// pas membre (ou kick)
 		else
 			this->send_channel(target, msg, client.fd);
 		return ;
@@ -221,6 +211,153 @@ void	Server::cmd_privmsg(Client &client, const Command &cmd)
 		}
 	}
 	reply(client, "401", target, "No such nick/channel");
+}
+
+// TOPIC #chan        -> affiche le topic
+// TOPIC #chan :texte -> change le topic (operateur obligatoire si mode t)
+void	Server::cmd_topic(Client &client, const Command &cmd)
+{
+	if (cmd.params.empty())
+	{
+		reply(client, "461", "TOPIC", "Not enough parameters");
+		return ;
+	}
+	std::string	name = cmd.params[0];
+
+	if (this->all_channel.count(name) == 0)
+	{
+		reply(client, "403", name, "No such channel");
+		return ;
+	}
+	Channel	&channel = this->all_channel[name];
+
+	if (channel.members.count(client.fd) == 0)
+	{
+		reply(client, "442", name, "You're not on that channel");
+		return ;
+	}
+	if (cmd.params.size() == 1)
+	{
+		if (channel.topic.empty())
+			reply(client, "331", name, "No topic is set");
+		else
+			reply(client, "332", name, channel.topic);
+		return ;
+	}
+	if (channel.topic_restricted && channel.ops.count(client.fd) == 0)
+	{
+		reply(client, "482", name, "You're not channel operator");
+		return ;
+	}
+	channel.topic = cmd.params[1];
+	this->send_channel(name, prefix_of(client) + " TOPIC " + name + " :" + channel.topic + "\r\n", -1);
+}
+
+// KICK #chan pseudo [:raison] -> ejecte pseudo du channel (operateur obligatoire)
+void	Server::cmd_kick(Client &client, const Command &cmd)
+{
+	if (cmd.params.size() < 2)
+	{
+		reply(client, "461", "KICK", "Not enough parameters");
+		return ;
+	}
+	std::string	name = cmd.params[0];
+	std::string	nick = cmd.params[1];
+
+	if (this->all_channel.count(name) == 0)
+	{
+		reply(client, "403", name, "No such channel");
+		return ;
+	}
+	Channel	&channel = this->all_channel[name];
+
+	if (channel.members.count(client.fd) == 0)
+	{
+		reply(client, "442", name, "You're not on that channel");
+		return ;
+	}
+	if (channel.ops.count(client.fd) == 0)
+	{
+		reply(client, "482", name, "You're not channel operator");
+		return ;
+	}
+	Client	*target = this->find_client(nick);
+
+	if (target == NULL)
+	{
+		reply(client, "401", nick, "No such nick/channel");
+		return ;
+	}
+	if (channel.members.count(target->fd) == 0)
+	{
+		reply(client, "441", nick + " " + name, "They aren't on that channel");
+		return ;
+	}
+	std::string	reason = client.nickname;
+
+	if (cmd.params.size() > 2 && !cmd.params[2].empty())
+		reason = cmd.params[2];
+	// on previent tout le monde (la cible comprise) avant de la retirer
+	this->send_channel(name, prefix_of(client) + " KICK " + name + " " + nick + " :" + reason + "\r\n", -1);
+	this->leave_channel(name, target->fd);
+}
+
+// INVITE pseudo #chan -> autorise pseudo a rejoindre #chan (utile en mode i)
+// si le channel est en mode i, seul un operateur peut inviter
+void	Server::cmd_invite(Client &client, const Command &cmd)
+{
+	if (cmd.params.size() < 2)
+	{
+		reply(client, "461", "INVITE", "Not enough parameters");
+		return ;
+	}
+	std::string	nick = cmd.params[0];
+	std::string	name = cmd.params[1];
+	Client		*target = this->find_client(nick);
+
+	if (target == NULL)
+	{
+		reply(client, "401", nick, "No such nick/channel");
+		return ;
+	}
+	if (this->all_channel.count(name) == 0)
+	{
+		reply(client, "403", name, "No such channel");
+		return ;
+	}
+	Channel	&channel = this->all_channel[name];
+
+	if (channel.members.count(client.fd) == 0)
+	{
+		reply(client, "442", name, "You're not on that channel");
+		return ;
+	}
+	if (channel.invite_only && channel.ops.count(client.fd) == 0)
+	{
+		reply(client, "482", name, "You're not channel operator");
+		return ;
+	}
+	if (channel.members.count(target->fd))
+	{
+		reply(client, "443", nick + " " + name, "is already on channel");
+		return ;
+	}
+	channel.invited.insert(target->fd);
+	// 341 confirme a celui qui invite, la cible recoit le INVITE
+	client.outbuffer += ":ircserv 341 " + client.nickname + " " + nick + " " + name + "\r\n";
+	target->outbuffer += prefix_of(client) + " INVITE " + nick + " " + name + "\r\n";
+}
+
+// PING :texte -> le client verifie que la connexion est vivante, on renvoie PONG
+// (sans reponse, irssi/hexchat se deconnectent au bout de quelques minutes)
+void	Server::cmd_ping(Client &client, const Command &cmd)
+{
+	if (cmd.params.empty())
+	{
+		reply(client, "409", "", "No origin specified");
+		return ;
+	}
+	client.outbuffer += ":ircserv PONG ircserv :" + cmd.params[0] + "\r\n";
 }
 
 // quand PASS + NICK + USER sont faits, le client est enregistre
@@ -246,14 +383,20 @@ void	Server::execute(Client &client, const std::string &line)
 		this->cmd_nick(client, cmd);
 	else if (cmd.name == "USER")
 		this->cmd_user(client, cmd);
+	else if (cmd.name == "PING")
+		this->cmd_ping(client, cmd);
 	else if (!client.registered)
 		reply(client, "451", "", "You have not registered");
 	else if (cmd.name == "JOIN")
 		this->cmd_join(client, cmd);
-	else if (cmd.name == "PART")
-		this->cmd_part(client, cmd);
 	else if (cmd.name == "PRIVMSG")
 		this->cmd_privmsg(client, cmd);
+	else if (cmd.name == "TOPIC")
+		this->cmd_topic(client, cmd);
+	else if (cmd.name == "KICK")
+		this->cmd_kick(client, cmd);
+	else if (cmd.name == "INVITE")
+		this->cmd_invite(client, cmd);
 	else
 		reply(client, "421", cmd.name, "Unknown command");
 	this->try_register(client);
